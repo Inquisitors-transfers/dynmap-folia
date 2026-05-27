@@ -1,34 +1,38 @@
-package org.dynmap.bukkit;
+package org.dynmap.bukkit.helper.folia26;
 
+import java.util.Collections;
+import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CompletableFuture;
-import java.util.Collections;
-import java.util.concurrent.Future;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Future;
 import java.util.function.Consumer;
 
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
 import org.bukkit.World;
 import org.bukkit.entity.Entity;
+import org.bukkit.plugin.Plugin;
 import org.dynmap.Log;
+import org.dynmap.bukkit.helper.FoliaAccess;
 
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 
-final class FoliaCompat {
-    private final DynmapPlugin plugin;
+public final class FoliaAccessFolia26 implements FoliaAccess {
+    private final Plugin plugin;
     private final Set<String> diagnostics = Collections.newSetFromMap(new ConcurrentHashMap<String, Boolean>());
 
-    FoliaCompat(DynmapPlugin plugin) {
+    public FoliaAccessFolia26(Plugin plugin) {
         this.plugin = plugin;
     }
 
-    boolean isFolia() {
+    @Override
+    public boolean isFolia() {
         return true;
     }
 
-    void runGlobal(Runnable run, long delayTicks) {
+    @Override
+    public void runGlobal(Runnable run, long delayTicks) {
         if ((delayTicks <= 0) && isGlobalOrStartupThread()) {
             run.run();
         }
@@ -40,12 +44,14 @@ final class FoliaCompat {
         }
     }
 
-    void runGlobalRepeating(Runnable run, long initialDelayTicks, long periodTicks) {
+    @Override
+    public void runGlobalRepeating(Runnable run, long initialDelayTicks, long periodTicks) {
         Bukkit.getGlobalRegionScheduler().runAtFixedRate(plugin, toConsumer(run),
                 normalizeDelay(initialDelayTicks), Math.max(1L, periodTicks));
     }
 
-    void runRegion(Location loc, Runnable run, long delayTicks) {
+    @Override
+    public void runRegion(Location loc, Runnable run, long delayTicks) {
         if ((loc == null) || (loc.getWorld() == null)) {
             runGlobal(run, delayTicks);
         }
@@ -60,7 +66,8 @@ final class FoliaCompat {
         }
     }
 
-    void runEntity(Entity entity, Runnable run, long delayTicks) {
+    @Override
+    public void runEntity(Entity entity, Runnable run, long delayTicks) {
         if (entity == null) {
             runGlobal(run, delayTicks);
         }
@@ -68,14 +75,23 @@ final class FoliaCompat {
             run.run();
         }
         else if (delayTicks <= 0) {
-            entity.getScheduler().run(plugin, toConsumer(run), () -> { });
+            entity.getScheduler().run(plugin, toConsumer(run), new Runnable() {
+                @Override
+                public void run() {
+                }
+            });
         }
         else {
-            entity.getScheduler().runDelayed(plugin, toConsumer(run), () -> { }, delayTicks);
+            entity.getScheduler().runDelayed(plugin, toConsumer(run), new Runnable() {
+                @Override
+                public void run() {
+                }
+            }, delayTicks);
         }
     }
 
-    <T> Future<T> callGlobal(final Callable<T> task) {
+    @Override
+    public <T> Future<T> callGlobal(final Callable<T> task) {
         final CompletableFuture<T> future = new CompletableFuture<T>();
         if (isGlobalOrStartupThread()) {
             completeFuture(future, task);
@@ -91,7 +107,8 @@ final class FoliaCompat {
         return future;
     }
 
-    <T> Future<T> callRegion(World world, int chunkX, int chunkZ, final Callable<T> task) {
+    @Override
+    public <T> Future<T> callRegion(World world, int chunkX, int chunkZ, final Callable<T> task) {
         final CompletableFuture<T> future = new CompletableFuture<T>();
         if (world == null) {
             future.complete(null);
@@ -110,11 +127,13 @@ final class FoliaCompat {
         return future;
     }
 
-    boolean isOwnedByCurrentRegion(World world, int chunkX, int chunkZ) {
+    @Override
+    public boolean isOwnedByCurrentRegion(World world, int chunkX, int chunkZ) {
         return (world != null) && Bukkit.isOwnedByCurrentRegion(world, chunkX, chunkZ);
     }
 
-    <T> Future<T> callEntity(Entity entity, final Callable<T> task) {
+    @Override
+    public <T> Future<T> callEntity(Entity entity, final Callable<T> task) {
         final CompletableFuture<T> future = new CompletableFuture<T>();
         if (entity == null) {
             future.complete(null);
@@ -141,31 +160,36 @@ final class FoliaCompat {
         return future;
     }
 
-    boolean isServerThread() {
+    @Override
+    public boolean isServerThread() {
         return isGlobalOrStartupThread();
     }
 
-    void warnIfNotGlobal(String action) {
+    @Override
+    public void warnIfNotGlobal(String action) {
         if (!isGlobalOrStartupThread()) {
             warnOnce("global:" + action, action + " ran away from the Folia global region thread");
         }
     }
 
-    void warnIfNotRegion(String action, Location loc) {
+    @Override
+    public void warnIfNotRegion(String action, Location loc) {
         if ((loc != null) && (loc.getWorld() != null) && !Bukkit.isOwnedByCurrentRegion(loc)) {
             warnOnce("region:" + action, action + " touched " + formatLocation(loc)
                     + " away from its owning Folia region thread");
         }
     }
 
-    void warnIfNotEntity(String action, Entity entity) {
+    @Override
+    public void warnIfNotEntity(String action, Entity entity) {
         if ((entity != null) && !Bukkit.isOwnedByCurrentRegion(entity)) {
             warnOnce("entity:" + action, action + " touched entity " + entity.getUniqueId()
                     + " away from its owning Folia region thread");
         }
     }
 
-    void cancelTasks() {
+    @Override
+    public void cancelTasks() {
         Bukkit.getGlobalRegionScheduler().cancelTasks(plugin);
         Bukkit.getAsyncScheduler().cancelTasks(plugin);
     }

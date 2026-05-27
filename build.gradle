@@ -34,7 +34,6 @@ allprojects  {
      maven { url "https://oss.sonatype.org/content/repositories/snapshots" }
      maven { url "https://repo.mikeprimm.com" }
      maven { url "https://repo.maven.apache.org/maven2" }
-     maven { url "https://repo.papermc.io/repository/maven-public/" }
      maven { url "https://hub.spigotmc.org/nexus/content/repositories/snapshots/" }
      maven { url "https://repo.codemc.org/repository/maven-public/" }
   }
@@ -58,10 +57,8 @@ subprojects {
   apply plugin: 'java'
   apply plugin: 'maven-publish'
 
-  java {
-    sourceCompatibility = JavaVersion.VERSION_1_8
-    targetCompatibility = JavaVersion.VERSION_1_8
-  }
+  sourceCompatibility = 1.8
+  targetCompatibility = 1.8
   tasks.withType(JavaCompile) {
   	options.encoding = 'UTF-8'
   }
