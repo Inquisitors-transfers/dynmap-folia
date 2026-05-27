@@ -110,6 +110,10 @@ final class FoliaCompat {
         return future;
     }
 
+    boolean isOwnedByCurrentRegion(World world, int chunkX, int chunkZ) {
+        return (world != null) && Bukkit.isOwnedByCurrentRegion(world, chunkX, chunkZ);
+    }
+
     <T> Future<T> callEntity(Entity entity, final Callable<T> task) {
         final CompletableFuture<T> future = new CompletableFuture<T>();
         if (entity == null) {

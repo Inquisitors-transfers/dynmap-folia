@@ -803,6 +803,203 @@ public abstract class AbstractMapChunkCache extends MapChunkCache {
 
     public abstract Snapshot wrapChunkSnapshot(ChunkSnapshot css);
 
+    /**
+     * Load one known chunk while the caller is already on that chunk's owning
+     * server/region thread.
+     */
+    public int loadChunkForCurrentRegion(DynmapChunk chunk) {
+        if(dw.isLoaded() == false) {
+            return 0;
+        }
+        Object queue = BukkitVersionHelper.helper.getUnloadQueue(w);
+
+        long startTime = System.nanoTime();
+        boolean vis = true;
+        if(visible_limits != null) {
+            vis = false;
+            for(VisibilityLimit limit : visible_limits) {
+                if (limit.doIntersectChunk(chunk.x, chunk.z)) {
+                    vis = true;
+                    break;
+                }
+            }
+        }
+        if(vis && (hidden_limits != null)) {
+            for(VisibilityLimit limit : hidden_limits) {
+                if (limit.doIntersectChunk(chunk.x, chunk.z)) {
+                    vis = false;
+                    break;
+                }
+            }
+        }
+
+        Snapshot ss;
+        long inhabited_ticks;
+        DynIntHashMap tileData;
+        int chunkIndex = (chunk.x-x_min) + (chunk.z - z_min)*x_dim;
+        if(snaparray[chunkIndex] != null) {
+            return 1;
+        }
+
+        DynmapCore.setIgnoreChunkLoads(true);
+        try {
+            SnapshotRec ssr = SnapshotCache.sscache.getSnapshot(dw.getName(), chunk.x, chunk.z, blockdata, biome, biomeraw, highesty);
+            if(ssr != null) {
+                inhabited_ticks = ssr.inhabitedTicks;
+                if(!vis) {
+                    if (null == hidestyle)
+                        ss = EMPTY;
+                    else {
+                        switch (hidestyle) {
+                            case FILL_STONE_PLAIN:
+                                ss = STONE;
+                                break;
+                            case FILL_OCEAN:
+                                ss = OCEAN;
+                                break;
+                            default:
+                                ss = EMPTY;
+                                break;
+                        }
+                    }
+                }
+                else {
+                    ss = ssr.ss;
+                }
+                snaparray[chunkIndex] = ss;
+                snaptile[chunkIndex] = ssr.tileData;
+                inhabitedTicks[chunkIndex] = inhabited_ticks;
+                endChunkLoad(startTime, ChunkStats.CACHED_SNAPSHOT_HIT);
+                return 1;
+            }
+
+            boolean wasLoaded = w.isChunkLoaded(chunk.x, chunk.z);
+            boolean didload = false;
+            boolean isunloadpending = false;
+            if (queue != null) {
+                isunloadpending = BukkitVersionHelper.helper.isInUnloadQueue(queue, chunk.x, chunk.z);
+            }
+            if (isunloadpending) {
+                wasLoaded = true;
+            }
+            try {
+                didload = loadChunkNoGenerate(w, chunk.x, chunk.z);
+            } catch (Throwable t) {
+                Log.warning("Bukkit error loading chunk " + chunk.x + "," + chunk.z + " on " + w.getName());
+                if(!wasLoaded) {
+                    didload = w.isChunkLoaded(chunk.x, chunk.z);
+                }
+            }
+            if(didload) {
+                tileData = new DynIntHashMap();
+                Chunk c = w.getChunkAt(chunk.x, chunk.z);
+                inhabited_ticks = BukkitVersionHelper.helper.getInhabitedTicks(c);
+                if(!vis) {
+                    if(null == hidestyle) {
+                        ss = EMPTY;
+                    }
+                    else {
+                        switch (hidestyle) {
+                            case FILL_STONE_PLAIN:
+                                ss = STONE;
+                                break;
+                            case FILL_OCEAN:
+                                ss = OCEAN;
+                                break;
+                            default:
+                                ss = EMPTY;
+                                break;
+                        }
+                    }
+                }
+                else {
+                    ChunkSnapshot css;
+                    if(blockdata || highesty) {
+                        css = c.getChunkSnapshot(highesty, biome, biomeraw);
+                        ss = wrapChunkSnapshot(css);
+                        List<Object> vals = new ArrayList<>();
+                        Map<?,?> tileents = BukkitVersionHelper.helper.getTileEntitiesForChunk(c);
+                        for(Object t : tileents.values()) {
+                            int te_x = BukkitVersionHelper.helper.getTileEntityX(t);
+                            int te_y = BukkitVersionHelper.helper.getTileEntityY(t);
+                            int te_z = BukkitVersionHelper.helper.getTileEntityZ(t);
+                            int cx = te_x & 0xF;
+                            int cz = te_z & 0xF;
+                            String[] te_fields = HDBlockModels.getTileEntityFieldsNeeded(ss.getBlockType(cx, te_y, cz));
+                            if(te_fields != null) {
+                                Object nbtcompound = BukkitVersionHelper.helper.readTileEntityNBT(t, this.w);
+                                vals.clear();
+                                for(String id: te_fields) {
+                                    Object val = BukkitVersionHelper.helper.getFieldValue(nbtcompound, id);
+                                    if(val != null) {
+                                        vals.add(id);
+                                        vals.add(val);
+                                    }
+                                }
+                                if (!vals.isEmpty()) {
+                                    Object[] vlist = vals.toArray(new Object[0]);
+                                    tileData.put(getIndexInChunk(cx,te_y,cz), vlist);
+                                }
+                            }
+                        }
+                    }
+                    else {
+                        css = w.getEmptyChunkSnapshot(chunk.x, chunk.z, biome, biomeraw);
+                        ss = wrapChunkSnapshot(css);
+                    }
+                    if(ss != null) {
+                        ssr = new SnapshotRec();
+                        ssr.ss = ss;
+                        ssr.inhabitedTicks = inhabited_ticks;
+                        ssr.tileData = tileData;
+                        SnapshotCache.sscache.putSnapshot(dw.getName(), chunk.x, chunk.z, ssr, blockdata, biome, biomeraw, highesty);
+                    }
+                }
+                snaparray[chunkIndex] = ss;
+                snaptile[chunkIndex] = tileData;
+                inhabitedTicks[chunkIndex] = inhabited_ticks;
+
+                if (!wasLoaded) {
+                    if (w.isChunkInUse(chunk.x, chunk.z) == false) {
+                        if (BukkitVersionHelper.helper.isUnloadChunkBroken()) {
+                            w.unloadChunkRequest(chunk.x, chunk.z);
+                        }
+                        else {
+                            BukkitVersionHelper.helper.unloadChunkNoSave(w, c, chunk.x, chunk.z);
+                        }
+                    }
+                    endChunkLoad(startTime, ChunkStats.UNLOADED_CHUNKS);
+                }
+                else if (isunloadpending) {
+                    if (w.isChunkInUse(chunk.x, chunk.z) == false) {
+                        w.unloadChunkRequest(chunk.x, chunk.z);
+                    }
+                    endChunkLoad(startTime, ChunkStats.LOADED_CHUNKS);
+                }
+                else {
+                    endChunkLoad(startTime, ChunkStats.LOADED_CHUNKS);
+                }
+            }
+            else {
+                endChunkLoad(startTime, ChunkStats.UNGENERATED_CHUNKS);
+            }
+            return 1;
+        } finally {
+            DynmapCore.setIgnoreChunkLoads(false);
+        }
+    }
+
+    public void finishLoadingChunks() {
+        iterator = chunks.listIterator(chunks.size());
+        isempty = true;
+        for(int i = 0; i < snaparray.length; i++) {
+            if(snaparray[i] == null)
+                snaparray[i] = EMPTY;
+            else if(snaparray[i] != EMPTY)
+                isempty = false;
+        }
+    }
+
     // Load chunk snapshots
     @Override
     public int loadChunks(int max_to_load) {

@@ -2,6 +2,7 @@ package org.dynmap.bukkit;
 
 import java.io.File;
 import java.net.InetSocketAddress;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -78,6 +79,7 @@ import org.dynmap.MapType;
 import org.dynmap.PlayerList;
 import org.dynmap.bukkit.helper.BukkitVersionHelper;
 import org.dynmap.bukkit.helper.BukkitWorld;
+import org.dynmap.bukkit.helper.AbstractMapChunkCache;
 import org.dynmap.bukkit.helper.SnapshotCache;
 import org.dynmap.bukkit.permissions.BukkitPermissions;
 import org.dynmap.bukkit.permissions.NijikokunPermissions;
@@ -132,6 +134,7 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
     private World last_world;
     private BukkitWorld last_bworld;
     private FoliaCompat folia;
+    private int foliaChunkBatchSize = 16;
     
     private BukkitVersionHelper helper;
 
@@ -793,40 +796,37 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
             if(bworld == null) {
                 return null;
             }
-            for(final DynmapChunk chunk : chunks) {
+            List<DynmapChunk> pending = new ArrayList<DynmapChunk>(chunks);
+            while(!pending.isEmpty()) {
                 if(w.isLoaded() == false) {
                     return null;
                 }
-                boolean loaded = false;
-                while(!loaded) {
-                    final World fbworld = bworld;
-                    loaded = getFutureValue(folia.callRegion(fbworld, chunk.x, chunk.z, new Callable<Boolean>() {
-                        @Override
-                        public Boolean call() throws Exception {
-                            if(!claimChunkLoadSlot()) {
-                                return false;
-                            }
-                            if(cc instanceof GenericMapChunkCache) {
-                                ((GenericMapChunkCache)cc).loadChunkForCurrentRegion(chunk);
-                            }
-                            else {
-                                cc.loadChunks(1);
-                            }
-                            return true;
-                        }
-                    }), false);
-                    if(!loaded) {
-                        try {
-                            Thread.sleep(25);
-                        } catch (InterruptedException ix) {
-                            Thread.currentThread().interrupt();
-                            return null;
-                        }
+                if(claimChunkLoadSlots(1) <= 0) {
+                    sleepForNextChunkWindow();
+                    continue;
+                }
+                final World fbworld = bworld;
+                final List<DynmapChunk> candidates = pending;
+                final DynmapChunk anchor = candidates.get(0);
+                FoliaChunkBatchResult result = getFutureValue(folia.callRegion(fbworld, anchor.x, anchor.z, new Callable<FoliaChunkBatchResult>() {
+                    @Override
+                    public FoliaChunkBatchResult call() throws Exception {
+                        return loadFoliaChunkBatch(fbworld, cc, candidates);
+                    }
+                }), retryFoliaChunkBatch(candidates));
+                if(result.loadedChunks <= 0) {
+                    refundChunkLoadSlots(1);
+                    if(!sleepForNextChunkWindow()) {
+                        return null;
                     }
                 }
+                pending = result.retryChunks;
             }
             if(cc instanceof GenericMapChunkCache) {
                 ((GenericMapChunkCache)cc).finishLoadingChunks();
+            }
+            else if(cc instanceof AbstractMapChunkCache) {
+                ((AbstractMapChunkCache)cc).finishLoadingChunks();
             }
             if(w.isLoaded() == false) {
                 return null;
@@ -834,7 +834,59 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
             return cc;
         }
 
-        private boolean claimChunkLoadSlot() {
+        private FoliaChunkBatchResult loadFoliaChunkBatch(World world, MapChunkCache cc, List<DynmapChunk> candidates) {
+            int loaded = 0;
+            List<DynmapChunk> retry = new ArrayList<DynmapChunk>();
+            boolean budgetExhausted = false;
+            for(DynmapChunk chunk : candidates) {
+                if(budgetExhausted) {
+                    retry.add(chunk);
+                    continue;
+                }
+                if(loaded >= foliaChunkBatchSize) {
+                    retry.add(chunk);
+                    continue;
+                }
+                if(!folia.isOwnedByCurrentRegion(world, chunk.x, chunk.z)) {
+                    retry.add(chunk);
+                    continue;
+                }
+                if((loaded > 0) && (claimChunkLoadSlots(1) <= 0)) {
+                    retry.add(chunk);
+                    budgetExhausted = true;
+                    continue;
+                }
+                if(cc instanceof GenericMapChunkCache) {
+                    ((GenericMapChunkCache)cc).loadChunkForCurrentRegion(chunk);
+                    loaded++;
+                }
+                else if(cc instanceof AbstractMapChunkCache) {
+                    ((AbstractMapChunkCache)cc).loadChunkForCurrentRegion(chunk);
+                    loaded++;
+                }
+                else {
+                    cc.loadChunks(1);
+                    loaded++;
+                }
+            }
+            return new FoliaChunkBatchResult(loaded, retry);
+        }
+
+        private FoliaChunkBatchResult retryFoliaChunkBatch(List<DynmapChunk> chunks) {
+            return new FoliaChunkBatchResult(0, new ArrayList<DynmapChunk>(chunks));
+        }
+
+        private boolean sleepForNextChunkWindow() {
+            try {
+                Thread.sleep(25);
+                return true;
+            } catch (InterruptedException ix) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+
+        private int claimChunkLoadSlots(int requested) {
             synchronized(DynmapPlugin.this) {
                 long now = System.nanoTime();
                 if (prev_tick != cur_tick) {
@@ -842,10 +894,27 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
                     cur_tick_starttime = now;
                 }
                 if((chunks_in_cur_tick <= 0) || ((now - cur_tick_starttime) > perTickLimit)) {
-                    return false;
+                    return 0;
                 }
-                chunks_in_cur_tick--;
-                return true;
+                int claimed = Math.min(chunks_in_cur_tick, requested);
+                chunks_in_cur_tick -= claimed;
+                return claimed;
+            }
+        }
+
+        private void refundChunkLoadSlots(int refunded) {
+            synchronized(DynmapPlugin.this) {
+                chunks_in_cur_tick += refunded;
+            }
+        }
+
+        private class FoliaChunkBatchResult {
+            final int loadedChunks;
+            final List<DynmapChunk> retryChunks;
+
+            FoliaChunkBatchResult(int loadedChunks, List<DynmapChunk> retryChunks) {
+                this.loadedChunks = loadedChunks;
+                this.retryChunks = retryChunks;
             }
         }
         @Override
@@ -1429,6 +1498,7 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
             this.setEnabled(false);
             return;
         }
+        foliaChunkBatchSize = Math.max(1, Math.min(256, core.configuration.getInteger("folia-chunk-batch-size", 16)));
 
         /* Skins support via SkinsRestorer */
         SkinsRestorerSkinUrlProvider skinUrlProvider = null;
