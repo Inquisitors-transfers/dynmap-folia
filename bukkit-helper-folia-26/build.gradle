@@ -1,0 +1,25 @@
+apply plugin: 'eclipse'
+
+eclipse {
+    project {
+        name = "Dynmap(Folia-26)"
+    }
+}
+
+description = 'bukkit-helper-folia-26'
+
+sourceCompatibility = targetCompatibility = compileJava.sourceCompatibility = compileJava.targetCompatibility = '21'
+
+repositories {
+    maven {
+        url 'https://repo.papermc.io/repository/maven-public/'
+    }
+}
+
+dependencies {
+    implementation project(':bukkit-helper')
+    implementation project(':dynmap-api')
+    implementation project(path: ':DynmapCore', configuration: 'shadow')
+    compileOnly('io.papermc.paper:paper-api:1.21.11-R0.1-SNAPSHOT')
+    compileOnly('com.google.code.gson:gson:2.8.9')
+}

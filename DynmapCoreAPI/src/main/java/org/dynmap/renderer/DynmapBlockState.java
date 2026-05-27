@@ -413,6 +413,9 @@ public class DynmapBlockState {
      * @return state, or null if not defined
      */
     public final DynmapBlockState getState(int idx) {
+        if (idx < 0) {
+            return baseState;
+        }
         if (baseState.states == null) {
             return (idx == 0) ? this : AIR;
         }

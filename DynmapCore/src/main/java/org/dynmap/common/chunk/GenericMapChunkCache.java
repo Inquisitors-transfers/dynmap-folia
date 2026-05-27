@@ -882,6 +882,78 @@ public abstract class GenericMapChunkCache extends MapChunkCache {
 	}
 
 	/**
+	 * Load one known chunk while the caller is already on that chunk's owning
+	 * server/region thread.
+	 */
+	public int loadChunkForCurrentRegion(DynmapChunk chunk) {
+		if (!dw.isLoaded()) {
+			isempty = true;
+			unloadChunks();
+			return 0;
+		}
+
+		int chunkindex = (chunk.x - x_min) + (chunk.z - z_min) * x_dim;
+		if (snaparray[chunkindex] != null) {
+			return 0;
+		}
+
+		long startTime = System.nanoTime();
+		boolean vis = isChunkVisible(chunk);
+
+		if (tryChunkCache(chunk, vis)) {
+			endChunkLoad(startTime, ChunkStats.CACHED_SNAPSHOT_HIT);
+			return 1;
+		}
+
+		GenericChunk ss = getLoadedChunk(chunk);
+		ChunkStats stat = ChunkStats.LOADED_CHUNKS;
+		if (ss == null) {
+			ss = loadChunk(chunk);
+			stat = (ss != null) ? ChunkStats.UNLOADED_CHUNKS : ChunkStats.UNGENERATED_CHUNKS;
+		}
+
+		if (ss != null) {
+			if (vis) {
+				prepChunkSnapshot(chunk, ss);
+			}
+			else {
+				ss = getHiddenChunk();
+			}
+			snaparray[chunkindex] = ss;
+		}
+
+		endChunkLoad(startTime, stat);
+		return 1;
+	}
+
+	public void finishLoadingChunks() {
+		iterator = Collections.emptyListIterator();
+		isempty = true;
+		for (int i = 0; i < snaparray.length; i++) {
+			if (snaparray[i] == null) {
+				snaparray[i] = getEmpty();
+			}
+			else if (!snaparray[i].isEmpty) {
+				isempty = false;
+			}
+		}
+	}
+
+	private GenericChunk getHiddenChunk() {
+		if (null == hidestyle) {
+			return getEmpty();
+		}
+		switch (hidestyle) {
+			case FILL_STONE_PLAIN:
+				return getStone();
+			case FILL_OCEAN:
+				return getOcean();
+			default:
+				return getEmpty();
+		}
+	}
+
+	/**
 	 * Loads all chunks in the world asynchronously.
 	 * <p>
 	 * If it is not supported, it will throw {@link IllegalStateException}
