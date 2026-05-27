@@ -7,6 +7,7 @@ import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.Callable;
 
 import org.bukkit.Chunk;
 import org.bukkit.Location;
@@ -21,10 +22,20 @@ import org.dynmap.utils.Polygon;
 import org.dynmap.utils.TileFlags;
 
 public class BukkitWorld extends DynmapWorld {
+    public interface ThreadSafeAccess {
+        <T> T callGlobal(Callable<T> task, T def);
+        <T> T callRegion(World world, int chunkX, int chunkZ, Callable<T> task, T def);
+    }
+    private static ThreadSafeAccess threadSafeAccess;
     private World world;
+    private File worldfolder;
     private World.Environment env;
     private boolean skylight;
     private DynmapLocation spawnloc = new DynmapLocation();
+
+    public static void setThreadSafeAccess(ThreadSafeAccess access) {
+        threadSafeAccess = access;
+    }
     
     public BukkitWorld(World w) {
         this(w.getName(), w.getMaxHeight(), w.getSeaLevel(), w.getEnvironment(),
@@ -59,6 +70,7 @@ public class BukkitWorld extends DynmapWorld {
      */
     public void setWorldLoaded(World w) {
         world = w;
+        worldfolder = world.getWorldFolder();
         env = world.getEnvironment();
         skylight = (env == World.Environment.NORMAL);
     }
@@ -79,11 +91,17 @@ public class BukkitWorld extends DynmapWorld {
     @Override
     public DynmapLocation getSpawnLocation() {
         if(world != null) {
-            Location sloc = world.getSpawnLocation();
-            spawnloc.x = sloc.getBlockX();
-            spawnloc.y = sloc.getBlockY();
-            spawnloc.z = sloc.getBlockZ(); 
-            spawnloc.world = normalizeWorldName(sloc.getWorld().getName());
+            return callGlobal(new Callable<DynmapLocation>() {
+                @Override
+                public DynmapLocation call() throws Exception {
+                    Location sloc = world.getSpawnLocation();
+                    spawnloc.x = sloc.getBlockX();
+                    spawnloc.y = sloc.getBlockY();
+                    spawnloc.z = sloc.getBlockZ();
+                    spawnloc.world = normalizeWorldName(sloc.getWorld().getName());
+                    return spawnloc;
+                }
+            }, spawnloc);
         }
         return spawnloc;
     }
@@ -91,7 +109,12 @@ public class BukkitWorld extends DynmapWorld {
     @Override
     public long getTime() {
         if(world != null) {
-            return world.getTime();
+            return callGlobal(new Callable<Long>() {
+                @Override
+                public Long call() throws Exception {
+                    return world.getTime();
+                }
+            }, -1L);
         }
         else {
             return -1;
@@ -101,7 +124,12 @@ public class BukkitWorld extends DynmapWorld {
     @Override
     public boolean hasStorm() {
         if(world != null) {
-            return world.hasStorm();
+            return callGlobal(new Callable<Boolean>() {
+                @Override
+                public Boolean call() throws Exception {
+                    return world.hasStorm();
+                }
+            }, false);
         }
         else {
             return false;
@@ -111,7 +139,12 @@ public class BukkitWorld extends DynmapWorld {
     @Override
     public boolean isThundering() {
         if(world != null) {
-            return world.isThundering();
+            return callGlobal(new Callable<Boolean>() {
+                @Override
+                public Boolean call() throws Exception {
+                    return world.isThundering();
+                }
+            }, false);
         }
         else {
             return false;
@@ -127,7 +160,13 @@ public class BukkitWorld extends DynmapWorld {
     public int getLightLevel(int x, int y, int z) {
         if(world != null) {
             if ((y >= minY) && (y < this.worldheight)) {
-                return world.getBlockAt(x, y, z).getLightLevel();
+                final int fx = x, fy = y, fz = z;
+                return callRegion(world, x >> 4, z >> 4, new Callable<Integer>() {
+                    @Override
+                    public Integer call() throws Exception {
+                        return Integer.valueOf(world.getBlockAt(fx, fy, fz).getLightLevel());
+                    }
+                }, 0);
             }
             return 0;
         }
@@ -139,7 +178,13 @@ public class BukkitWorld extends DynmapWorld {
     @Override
     public int getHighestBlockYAt(int x, int z) {
         if(world != null) {
-            return world.getHighestBlockYAt(x, z);
+            final int fx = x, fz = z;
+            return callRegion(world, x >> 4, z >> 4, new Callable<Integer>() {
+                @Override
+                public Integer call() throws Exception {
+                    return world.getHighestBlockYAt(fx, fz);
+                }
+            }, -1);
         }
         else {
             return -1;
@@ -155,7 +200,13 @@ public class BukkitWorld extends DynmapWorld {
     public int getSkyLightLevel(int x, int y, int z) {
         if(world != null) {
             if ((y >= minY) && (y < this.worldheight)) {
-                return world.getBlockAt(x, y, z).getLightFromSky();
+                final int fx = x, fy = y, fz = z;
+                return callRegion(world, x >> 4, z >> 4, new Callable<Integer>() {
+                    @Override
+                    public Integer call() throws Exception {
+                        return Integer.valueOf(world.getBlockAt(fx, fy, fz).getLightFromSky());
+                    }
+                }, -1);
             }
             else {
                 return 15;
@@ -195,12 +246,15 @@ public class BukkitWorld extends DynmapWorld {
         map.clear();
         if (world == null) return -1;
         int cnt = 0;
-        // Mark loaded chunks
-        for(Chunk c : world.getLoadedChunks()) {
-            map.setFlag(c.getX(), c.getZ(), true);
-            cnt++;
+        if(threadSafeAccess == null) {
+            // Mark loaded chunks
+            for(Chunk c : world.getLoadedChunks()) {
+                map.setFlag(c.getX(), c.getZ(), true);
+                cnt++;
+            }
         }
-        File f = world.getWorldFolder();
+        File f = worldfolder;
+        if (f == null) return cnt;
         File regiondir = new File(f, "region");
         File[] lst = regiondir.listFiles();
         if(lst != null) {
@@ -244,9 +298,38 @@ public class BukkitWorld extends DynmapWorld {
     private Polygon lastBorder;
     @Override
     public Polygon getWorldBorder() {
-    	if (world != null) {
-    		lastBorder = BukkitVersionHelper.helper.getWorldBorder(world);
-    	}
-    	return lastBorder;
+        if (world != null) {
+            lastBorder = callGlobal(new Callable<Polygon>() {
+                @Override
+                public Polygon call() throws Exception {
+                    return BukkitVersionHelper.helper.getWorldBorder(world);
+                }
+            }, lastBorder);
+        }
+        return lastBorder;
+    }
+
+    private static <T> T callGlobal(Callable<T> task, T def) {
+        if(threadSafeAccess != null) {
+            return threadSafeAccess.callGlobal(task, def);
+        }
+        try {
+            T val = task.call();
+            return (val != null) ? val : def;
+        } catch (Exception x) {
+            return def;
+        }
+    }
+
+    private static <T> T callRegion(World world, int chunkX, int chunkZ, Callable<T> task, T def) {
+        if(threadSafeAccess != null) {
+            return threadSafeAccess.callRegion(world, chunkX, chunkZ, task, def);
+        }
+        try {
+            T val = task.call();
+            return (val != null) ? val : def;
+        } catch (Exception x) {
+            return def;
+        }
     }
 }

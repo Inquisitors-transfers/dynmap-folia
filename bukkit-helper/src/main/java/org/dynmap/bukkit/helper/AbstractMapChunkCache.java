@@ -871,6 +871,7 @@ public abstract class AbstractMapChunkCache extends MapChunkCache {
                 inhabitedTicks[idx] = inhabited_ticks;
                 
                 endChunkLoad(startTime, ChunkStats.CACHED_SNAPSHOT_HIT);
+                cnt++;
                 continue;
             }
             boolean wasLoaded = w.isChunkLoaded(chunk.x, chunk.z);

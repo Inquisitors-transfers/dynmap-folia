@@ -1,8 +1,6 @@
 package org.dynmap.bukkit;
 
 import java.io.File;
-import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.Method;
 import java.net.InetSocketAddress;
 import java.util.Collections;
 import java.util.HashMap;
@@ -116,10 +114,6 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
     public PluginManager pm;
     private Metrics metrics;
     private BukkitEnableCoreCallback enabCoreCB = new BukkitEnableCoreCallback();
-    private Method ismodloaded;
-    private Method instance;
-    private Method getindexedmodlist;
-    private Method getversion;
     private HashMap<String, BukkitWorld> world_by_name = new HashMap<String, BukkitWorld>();
     private HashSet<String> modsused = new HashSet<String>();
     // TPS calculator
@@ -137,16 +131,17 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
     /* Lookup cache */
     private World last_world;
     private BukkitWorld last_bworld;
+    private FoliaCompat folia;
     
     private BukkitVersionHelper helper;
 
-    private final BukkitWorld getWorldByName(String name) {
+    private final synchronized BukkitWorld getWorldByName(String name) {
         if((last_world != null) && (last_world.getName().equals(name))) {
             return last_bworld;
         }
         return world_by_name.get(name);
     }
-    private final BukkitWorld getWorld(World w) {
+    private final synchronized BukkitWorld getWorld(World w) {
         if(last_world == w) {
             return last_bworld;
         }
@@ -163,7 +158,7 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
 
         return bw;
     }
-    final void removeWorld(World w) {
+    final synchronized void removeWorld(World w) {
         world_by_name.remove(w.getName());
         if(w == last_world) {
             last_world = null;
@@ -196,6 +191,56 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
     private static final int getBlockIdFromBlock(Block block) {
         return getBlockIdFromMaterial(block.getType());
     }
+
+    private static final <T> T getFutureValue(Future<T> future, T def) {
+        if(future == null) {
+            return def;
+        }
+        try {
+            T val = future.get();
+            return (val != null) ? val : def;
+        } catch (CancellationException cx) {
+        } catch (InterruptedException ix) {
+            Thread.currentThread().interrupt();
+        } catch (ExecutionException ex) {
+            Log.severe("Exception while waiting for server task: ", ex.getCause());
+        }
+        return def;
+    }
+
+    private <T> T callPlayer(final Player player, final Callable<T> task, T def) {
+        if(player == null) {
+            return def;
+        }
+        if((folia != null) && folia.isFolia()) {
+            return getFutureValue(folia.callEntity(player, task), def);
+        }
+        try {
+            T val = task.call();
+            return (val != null) ? val : def;
+        } catch (Exception x) {
+            Log.warning("Error reading player state", x);
+            return def;
+        }
+    }
+
+    private String getSafePlayerName(final Player player) {
+        return callPlayer(player, new Callable<String>() {
+            @Override
+            public String call() throws Exception {
+                return player.getName();
+            }
+        }, null);
+    }
+
+    private String[] getSafePlayerNames(final Player player) {
+        return callPlayer(player, new Callable<String[]>() {
+            @Override
+            public String[] call() throws Exception {
+                return new String[] { player.getName(), player.getDisplayName() };
+            }
+        }, null);
+    }
     
     private class BukkitEnableCoreCallback extends DynmapCore.EnableCoreCallbacks {
         @Override
@@ -218,16 +263,6 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
     
     public DynmapPlugin() {
         plugin = this;
-        try {
-            Class<?> c = Class.forName("cpw.mods.fml.common.Loader");
-            ismodloaded = c.getMethod("isModLoaded", String.class);
-            instance = c.getMethod("instance");
-            getindexedmodlist = c.getMethod("getIndexedModList");
-            c = Class.forName("cpw.mods.fml.common.ModContainer");
-            getversion = c.getMethod("getVersion");
-        } catch (NoSuchMethodException nsmx) {
-        } catch (ClassNotFoundException e) {
-        }
     }
     
     private boolean banBrokenMsg = false;
@@ -235,9 +270,38 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
      * Server access abstraction class
      */
     public class BukkitServer extends DynmapServerInterface {
+        private World getBukkitWorldByName(final String wname) {
+            BukkitWorld bw = DynmapPlugin.this.getWorldByName(wname);
+            if(bw != null) {
+                return bw.getWorld();
+            }
+            if((folia != null) && folia.isFolia()) {
+                return getFutureValue(folia.callGlobal(new Callable<World>() {
+                    @Override
+                    public World call() throws Exception {
+                        return getServer().getWorld(wname);
+                    }
+                }), null);
+            }
+            return getServer().getWorld(wname);
+        }
+
         @Override
         public int getBlockIDAt(String wname, int x, int y, int z) {
-            World w = getServer().getWorld(wname);
+            World w = getBukkitWorldByName(wname);
+            if((folia != null) && folia.isFolia()) {
+                final World fw = w;
+                final int fx = x, fy = y, fz = z;
+                return getFutureValue(folia.callRegion(fw, x >> 4, z >> 4, new Callable<Integer>() {
+                    @Override
+                    public Integer call() throws Exception {
+                        if((fw != null) && fw.isChunkLoaded(fx >> 4, fz >> 4)) {
+                            return getBlockIdFromBlock(fw.getBlockAt(fx, fy, fz));
+                        }
+                        return -1;
+                    }
+                }), -1);
+            }
             if((w != null) && w.isChunkLoaded(x >> 4, z >> 4)) {
                 return getBlockIdFromBlock(w.getBlockAt(x, y, z));
             }
@@ -246,7 +310,21 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
 		
         @Override
         public int isSignAt(String wname, int x, int y, int z) {
-            World w = getServer().getWorld(wname);
+            World w = getBukkitWorldByName(wname);
+            if((folia != null) && folia.isFolia()) {
+                final World fw = w;
+                final int fx = x, fy = y, fz = z;
+                return getFutureValue(folia.callRegion(fw, x >> 4, z >> 4, new Callable<Integer>() {
+                    @Override
+                    public Integer call() throws Exception {
+                        if((fw != null) && fw.isChunkLoaded(fx >> 4, fz >> 4)) {
+                            Block b = fw.getBlockAt(fx, fy, fz);
+                            return (b.getState() instanceof Sign) ? 1 : 0;
+                        }
+                        return -1;
+                    }
+                }), -1);
+            }
             if((w != null) && w.isChunkLoaded(x >> 4, z >> 4)) {
                 Block b = w.getBlockAt(x, y, z);
                 BlockState s = b.getState();
@@ -262,10 +340,21 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
 
         @Override
         public void scheduleServerTask(Runnable run, long delay) {
-            getServer().getScheduler().scheduleSyncDelayedTask(DynmapPlugin.this, run, delay);
+            folia.runGlobal(run, delay);
         }
         @Override
         public DynmapPlayer[] getOnlinePlayers() {
+            if((folia != null) && folia.isFolia()) {
+                return getFutureValue(folia.callGlobal(new Callable<DynmapPlayer[]>() {
+                    @Override
+                    public DynmapPlayer[] call() throws Exception {
+                        return getOnlinePlayersUnsafe();
+                    }
+                }), new DynmapPlayer[0]);
+            }
+            return getOnlinePlayersUnsafe();
+        }
+        private DynmapPlayer[] getOnlinePlayersUnsafe() {
             Player[] players = helper.getOnlinePlayers();
             DynmapPlayer[] dplay = new DynmapPlayer[players.length];
             for(int i = 0; i < players.length; i++)
@@ -274,12 +363,35 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
         }
         @Override
         public void reload() {
+            if((folia != null) && folia.isFolia()) {
+                folia.runGlobal(new Runnable() {
+                    @Override
+                    public void run() {
+                        reloadUnsafe();
+                    }
+                }, 0);
+                return;
+            }
+            reloadUnsafe();
+        }
+        private void reloadUnsafe() {
             PluginManager pluginManager = getServer().getPluginManager();
             pluginManager.disablePlugin(DynmapPlugin.this);
             pluginManager.enablePlugin(DynmapPlugin.this);
         }
         @Override
         public DynmapPlayer getPlayer(String name) {
+            if((folia != null) && folia.isFolia()) {
+                return getFutureValue(folia.callGlobal(new Callable<DynmapPlayer>() {
+                    @Override
+                    public DynmapPlayer call() throws Exception {
+                        return getPlayerUnsafe(name);
+                    }
+                }), null);
+            }
+            return getPlayerUnsafe(name);
+        }
+        private DynmapPlayer getPlayerUnsafe(String name) {
             Player p = getServer().getPlayerExact(name);
             if(p != null) {
                 return new BukkitPlayer(p);
@@ -288,25 +400,44 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
         }
         @Override
         public Set<String> getIPBans() {
+            if((folia != null) && folia.isFolia()) {
+                return getFutureValue(folia.callGlobal(new Callable<Set<String>>() {
+                    @Override
+                    public Set<String> call() throws Exception {
+                        return getServer().getIPBans();
+                    }
+                }), Collections.<String>emptySet());
+            }
             return getServer().getIPBans();
         }
         @Override
         public <T> Future<T> callSyncMethod(Callable<T> task) {
             if(DynmapPlugin.this.isEnabled())
-                return getServer().getScheduler().callSyncMethod(DynmapPlugin.this, task);
+                return folia.callGlobal(task);
             else
                 return null;
         }
         private boolean noservername = false;
         @Override
         public String getServerName() {
-        	try {
-        		if (!noservername)
-        			return getServer().getServerName();
-        	} catch (NoSuchMethodError x) {	// Missing in 1.14 spigot - no idea why removed...
-        		noservername = true;
-        	}
-    		return getServer().getMotd();
+            if((folia != null) && folia.isFolia()) {
+                return getFutureValue(folia.callGlobal(new Callable<String>() {
+                    @Override
+                    public String call() throws Exception {
+                        return getServerNameUnsafe();
+                    }
+                }), "");
+            }
+            return getServerNameUnsafe();
+        }
+        private String getServerNameUnsafe() {
+            try {
+                if (!noservername)
+                    return getServer().getName();
+            } catch (NoSuchMethodError x) {
+                noservername = true;
+            }
+            return getServer().getMotd();
         }
         private boolean isBanned(OfflinePlayer p) {
         	try {
@@ -322,12 +453,23 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
         }
         @Override
         public boolean isPlayerBanned(String pid) {
+            if((folia != null) && folia.isFolia()) {
+                return getFutureValue(folia.callGlobal(new Callable<Boolean>() {
+                    @Override
+                    public Boolean call() throws Exception {
+                        return isPlayerBannedUnsafe(pid);
+                    }
+                }), false);
+            }
+            return isPlayerBannedUnsafe(pid);
+        }
+        private boolean isPlayerBannedUnsafe(String pid) {
             OfflinePlayer p = getServer().getOfflinePlayer(pid);
             return isBanned(p);
         }
         @Override
         public boolean isServerThread() {
-            return Bukkit.getServer().isPrimaryThread();
+            return folia.isServerThread();
         }
 
         @Override
@@ -361,6 +503,7 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
                     pm.registerEvents(new Listener() {
                         @EventHandler(priority=EventPriority.MONITOR, ignoreCancelled=true)
                         public void onPlayerBedLeave(PlayerBedLeaveEvent evt) {
+                            warnIfNotEntity("event:PLAYER_BED_LEAVE", evt.getPlayer());
                             DynmapPlayer p = new BukkitPlayer(evt.getPlayer());
                             core.listenerManager.processPlayerEvent(EventType.PLAYER_BED_LEAVE, p);
                         }
@@ -372,14 +515,14 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
                         public void onPlayerChat(AsyncPlayerChatEvent evt) {
                             final Player p = evt.getPlayer();
                             final String msg = evt.getMessage();
-                            getServer().getScheduler().scheduleSyncDelayedTask(DynmapPlugin.this, new Runnable() {
+                            folia.runEntity(p, new Runnable() {
                                 public void run() {
                                     DynmapPlayer dp = null;
                                     if(p != null)
                                         dp = new BukkitPlayer(p);
                                     core.listenerManager.processChatEvent(EventType.PLAYER_CHAT, dp, msg);
                                 }
-                            });
+                            }, 0);
                         }
                     }, DynmapPlugin.this);
                     break;
@@ -390,6 +533,7 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
                             Block b = evt.getBlock();
                             if(b == null) return;   /* Work around for stupid mods.... */
                             Location l = b.getLocation();
+                            warnIfNotRegion("event:BLOCK_BREAK", l);
                             core.listenerManager.processBlockEvent(EventType.BLOCK_BREAK, b.getType().name(),
                                 getWorld(l.getWorld()).getName(), l.getBlockX(), l.getBlockY(), l.getBlockZ());
                         }
@@ -401,9 +545,11 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
                         public void onSignChange(SignChangeEvent evt) {
                             Block b = evt.getBlock();
                             Location l = b.getLocation();
+                            warnIfNotRegion("event:SIGN_CHANGE", l);
                             String[] lines = evt.getLines();    /* Note: changes to this change event - intentional */
                             DynmapPlayer dp = null;
                             Player p = evt.getPlayer();
+                            warnIfNotEntity("event:SIGN_CHANGE", p);
                             if(p != null) dp = new BukkitPlayer(p);
                             core.listenerManager.processSignChangeEvent(EventType.SIGN_CHANGE, b.getType().name(),
                                 getWorld(l.getWorld()).getName(), l.getBlockX(), l.getBlockY(), l.getBlockZ(), lines, dp);
@@ -423,12 +569,32 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
         }
         @Override
         public boolean sendWebChatEvent(String source, String name, String msg) {
+            if((folia != null) && folia.isFolia()) {
+                return getFutureValue(folia.callGlobal(new Callable<Boolean>() {
+                    @Override
+                    public Boolean call() throws Exception {
+                        return sendWebChatEventUnsafe(source, name, msg);
+                    }
+                }), false);
+            }
+            return sendWebChatEventUnsafe(source, name, msg);
+        }
+        private boolean sendWebChatEventUnsafe(String source, String name, String msg) {
             DynmapWebChatEvent evt = new DynmapWebChatEvent(source, name, msg);
             getServer().getPluginManager().callEvent(evt);
             return ((evt.isCancelled() == false) && (evt.isProcessed() == false));
         }
         @Override
         public void broadcastMessage(String msg) {
+            if((folia != null) && folia.isFolia()) {
+                folia.runGlobal(new Runnable() {
+                    @Override
+                    public void run() {
+                        getServer().broadcastMessage(msg);
+                    }
+                }, 0);
+                return;
+            }
             getServer().broadcastMessage(msg);
         }
         @Override
@@ -458,6 +624,17 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
         }
         @Override
         public DynmapPlayer getOfflinePlayer(String name) {
+            if((folia != null) && folia.isFolia()) {
+                return getFutureValue(folia.callGlobal(new Callable<DynmapPlayer>() {
+                    @Override
+                    public DynmapPlayer call() throws Exception {
+                        return getOfflinePlayerUnsafe(name);
+                    }
+                }), null);
+            }
+            return getOfflinePlayerUnsafe(name);
+        }
+        private DynmapPlayer getOfflinePlayerUnsafe(String name) {
             OfflinePlayer op = getServer().getOfflinePlayer(name);
             if(op != null) {
                 return new BukkitPlayer(op);
@@ -466,6 +643,17 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
         }
         @Override
         public Set<String> checkPlayerPermissions(String player, Set<String> perms) {
+            if((folia != null) && folia.isFolia()) {
+                return getFutureValue(folia.callGlobal(new Callable<Set<String>>() {
+                    @Override
+                    public Set<String> call() throws Exception {
+                        return checkPlayerPermissionsUnsafe(player, perms);
+                    }
+                }), new HashSet<String>());
+            }
+            return checkPlayerPermissionsUnsafe(player, perms);
+        }
+        private Set<String> checkPlayerPermissionsUnsafe(String player, Set<String> perms) {
             OfflinePlayer p = getServer().getOfflinePlayer(player);
             if (isBanned(p))
                 return new HashSet<String>();
@@ -480,6 +668,17 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
         }
         @Override
         public boolean checkPlayerPermission(String player, String perm) {
+            if((folia != null) && folia.isFolia()) {
+                return getFutureValue(folia.callGlobal(new Callable<Boolean>() {
+                    @Override
+                    public Boolean call() throws Exception {
+                        return checkPlayerPermissionUnsafe(player, perm);
+                    }
+                }), false);
+            }
+            return checkPlayerPermissionUnsafe(player, perm);
+        }
+        private boolean checkPlayerPermissionUnsafe(String player, String perm) {
             OfflinePlayer p = getServer().getOfflinePlayer(player);
             if (isBanned(p))
                 return false;
@@ -517,6 +716,9 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
             }
 
             final MapChunkCache cc = c;
+            if((folia != null) && folia.isFolia()) {
+                return loadChunkCacheFolia(w, chunks, cc);
+            }
 
             while(!cc.isDoneLoading()) {
                 if (BukkitVersionHelper.helper.isUnsafeAsync()) {
@@ -582,47 +784,92 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
                 return null;
             return c;
         }
+
+        private MapChunkCache loadChunkCacheFolia(DynmapWorld w, List<DynmapChunk> chunks, MapChunkCache cc) {
+            if(!(w instanceof BukkitWorld)) {
+                return null;
+            }
+            World bworld = ((BukkitWorld)w).getWorld();
+            if(bworld == null) {
+                return null;
+            }
+            for(final DynmapChunk chunk : chunks) {
+                if(w.isLoaded() == false) {
+                    return null;
+                }
+                boolean loaded = false;
+                while(!loaded) {
+                    final World fbworld = bworld;
+                    loaded = getFutureValue(folia.callRegion(fbworld, chunk.x, chunk.z, new Callable<Boolean>() {
+                        @Override
+                        public Boolean call() throws Exception {
+                            if(!claimChunkLoadSlot()) {
+                                return false;
+                            }
+                            if(cc instanceof GenericMapChunkCache) {
+                                ((GenericMapChunkCache)cc).loadChunkForCurrentRegion(chunk);
+                            }
+                            else {
+                                cc.loadChunks(1);
+                            }
+                            return true;
+                        }
+                    }), false);
+                    if(!loaded) {
+                        try {
+                            Thread.sleep(25);
+                        } catch (InterruptedException ix) {
+                            Thread.currentThread().interrupt();
+                            return null;
+                        }
+                    }
+                }
+            }
+            if(cc instanceof GenericMapChunkCache) {
+                ((GenericMapChunkCache)cc).finishLoadingChunks();
+            }
+            if(w.isLoaded() == false) {
+                return null;
+            }
+            return cc;
+        }
+
+        private boolean claimChunkLoadSlot() {
+            synchronized(DynmapPlugin.this) {
+                long now = System.nanoTime();
+                if (prev_tick != cur_tick) {
+                    prev_tick = cur_tick;
+                    cur_tick_starttime = now;
+                }
+                if((chunks_in_cur_tick <= 0) || ((now - cur_tick_starttime) > perTickLimit)) {
+                    return false;
+                }
+                chunks_in_cur_tick--;
+                return true;
+            }
+        }
         @Override
         public int getMaxPlayers() {
+            if((folia != null) && folia.isFolia()) {
+                return getFutureValue(folia.callGlobal(new Callable<Integer>() {
+                    @Override
+                    public Integer call() throws Exception {
+                        return getServer().getMaxPlayers();
+                    }
+                }), 0);
+            }
             return getServer().getMaxPlayers();
         }
         @Override
         public int getCurrentPlayers() {
-            return helper.getOnlinePlayers().length;
+            return getOnlinePlayers().length;
         }
         @Override
         public boolean isModLoaded(String name) {
-            if(ismodloaded != null) {
-                try {
-                    Object rslt =ismodloaded.invoke(null,  name);
-                    if(rslt instanceof Boolean) {
-                        if(((Boolean)rslt).booleanValue()) {
-                            modsused.add(name);
-                            return true;
-                        }
-                    }
-                } catch (IllegalArgumentException iax) {
-                } catch (IllegalAccessException e) {
-                } catch (InvocationTargetException e) {
-                }
-            }
             return false;
         }
         @Override
         public String getModVersion(String name) {
-            if((instance != null) && (getindexedmodlist != null) && (getversion != null)) {
-                try {
-                    Object inst = instance.invoke(null);
-                    Map<?,?> modmap = (Map<?,?>) getindexedmodlist.invoke(inst);
-                    Object mod = modmap.get(name);
-                    if (mod != null) {
-                        return (String) getversion.invoke(mod);
-                    }
-                } catch (IllegalArgumentException iax) {
-                } catch (IllegalAccessException e) {
-                } catch (InvocationTargetException e) {
-                }
-            }
             return null;
         }
 
@@ -634,6 +881,14 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
         
         @Override
         public String getServerIP() {
+            if((folia != null) && folia.isFolia()) {
+                return getFutureValue(folia.callGlobal(new Callable<String>() {
+                    @Override
+                    public String call() throws Exception {
+                        return Bukkit.getServer().getIp();
+                    }
+                }), "");
+            }
             return Bukkit.getServer().getIp();
         }
 
@@ -664,31 +919,82 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
         public BukkitPlayer(Player p) {
             super(p);
             player = p;
-            offplayer = p.getPlayer();
-            uuid = p.getUniqueId();
-            skinurl = helper.getSkinURL(p);
+            offplayer = p;
+            uuid = callPlayer(new Callable<UUID>() {
+                @Override
+                public UUID call() throws Exception {
+                    return player.getUniqueId();
+                }
+            }, null);
+            skinurl = callPlayer(new Callable<String>() {
+                @Override
+                public String call() throws Exception {
+                    return helper.getSkinURL(player);
+                }
+            }, null);
         }
         public BukkitPlayer(OfflinePlayer p) {
             super(null);
             offplayer = p;
         }
+        private <T> T callPlayer(Callable<T> task, T def) {
+            if((folia != null) && folia.isFolia() && (player != null)) {
+                return getFutureValue(folia.callEntity(player, task), def);
+            }
+            try {
+                T val = task.call();
+                return (val != null) ? val : def;
+            } catch (Exception x) {
+                Log.warning("Error reading player state", x);
+                return def;
+            }
+        }
         @Override
         public boolean isConnected() {
+            if(player != null) {
+                return callPlayer(new Callable<Boolean>() {
+                    @Override
+                    public Boolean call() throws Exception {
+                        return player.isOnline();
+                    }
+                }, false);
+            }
             return offplayer.isOnline();
         }
         @Override
         public String getName() {
+            if(player != null) {
+                return callPlayer(new Callable<String>() {
+                    @Override
+                    public String call() throws Exception {
+                        return player.getName();
+                    }
+                }, offplayer.getName());
+            }
             return offplayer.getName();
         }
         @Override
         public String getDisplayName() {
-            if(player != null)
-                return player.getDisplayName();
-            else
-                return offplayer.getName();
+            if(player != null) {
+                return callPlayer(new Callable<String>() {
+                    @Override
+                    public String call() throws Exception {
+                        return player.getDisplayName();
+                    }
+                }, offplayer.getName());
+            }
+            return offplayer.getName();
         }
         @Override
         public boolean isOnline() {
+            if(player != null) {
+                return callPlayer(new Callable<Boolean>() {
+                    @Override
+                    public Boolean call() throws Exception {
+                        return player.isOnline();
+                    }
+                }, false);
+            }
             return offplayer.isOnline();
         }
         @Override
@@ -696,75 +1002,140 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
             if(player == null) {
                 return null;
             }
-            Location loc = player.getEyeLocation(); // Use eye location, since we show head 
-            return toLoc(loc);
+            return callPlayer(new Callable<DynmapLocation>() {
+                @Override
+                public DynmapLocation call() throws Exception {
+                    Location loc = player.getEyeLocation(); // Use eye location, since we show head
+                    return toLoc(loc);
+                }
+            }, null);
         }
         @Override
         public String getWorld() {
             if(player == null) {
                 return null;
             }
-            World w = player.getWorld();
-            if(w != null)
-                return DynmapPlugin.this.getWorld(w).getName();
-            return null;
+            return callPlayer(new Callable<String>() {
+                @Override
+                public String call() throws Exception {
+                    World w = player.getWorld();
+                    if(w != null)
+                        return DynmapPlugin.this.getWorld(w).getName();
+                    return null;
+                }
+            }, null);
         }
         @Override
         public InetSocketAddress getAddress() {
-            if(player != null)
-                return player.getAddress();
-            return null;
+            if(player == null)
+                return null;
+            return callPlayer(new Callable<InetSocketAddress>() {
+                @Override
+                public InetSocketAddress call() throws Exception {
+                    return player.getAddress();
+                }
+            }, null);
         }
         @Override
         public boolean isSneaking() {
-            if(player != null)
-                return player.isSneaking();
-            return false;
+            if(player == null)
+                return false;
+            return callPlayer(new Callable<Boolean>() {
+                @Override
+                public Boolean call() throws Exception {
+                    return player.isSneaking();
+                }
+            }, false);
         }
         @Override
         public double getHealth() {
-            if(player != null) {
-            	return Math.ceil(2.0 * player.getHealth() / player.getMaxHealth() * player.getHealthScale()) / 2.0;
-            }
-            else
+            if(player == null)
                 return 0;
+            return callPlayer(new Callable<Double>() {
+                @Override
+                public Double call() throws Exception {
+                    return Math.ceil(2.0 * player.getHealth() / player.getMaxHealth() * player.getHealthScale()) / 2.0;
+                }
+            }, 0.0);
         }
         @Override
         public int getArmorPoints() {
-            if(player != null)
-                return (int) player.getAttribute(Attribute.GENERIC_ARMOR).getValue();
-            else
+            if(player == null)
                 return 0;
+            return callPlayer(new Callable<Integer>() {
+                @Override
+                public Integer call() throws Exception {
+                    return (int) player.getAttribute(Attribute.ARMOR).getValue();
+                }
+            }, 0);
         }
         @Override
         public DynmapLocation getBedSpawnLocation() {
-            Location loc = offplayer.getBedSpawnLocation();
-            if(loc != null) {
-                return toLoc(loc);
+            if(player != null) {
+                return callPlayer(new Callable<DynmapLocation>() {
+                    @Override
+                    public DynmapLocation call() throws Exception {
+                        Location loc = player.getBedSpawnLocation();
+                        if(loc != null) {
+                            return toLoc(loc);
+                        }
+                        return null;
+                    }
+                }, null);
+            }
+            else {
+                Location loc = offplayer.getBedSpawnLocation();
+                if(loc != null) {
+                    return toLoc(loc);
+                }
             }
             return null;
         }
         @Override
         public long getLastLoginTime() {
+            if(player != null) {
+                return callPlayer(new Callable<Long>() {
+                    @Override
+                    public Long call() throws Exception {
+                        return player.getLastPlayed();
+                    }
+                }, 0L);
+            }
             return offplayer.getLastPlayed();
         }
         @Override
         public long getFirstLoginTime() {
+            if(player != null) {
+                return callPlayer(new Callable<Long>() {
+                    @Override
+                    public Long call() throws Exception {
+                        return player.getFirstPlayed();
+                    }
+                }, 0L);
+            }
             return offplayer.getFirstPlayed();
         }
         @Override
         public boolean isInvisible() {
-            if(player != null) {
-                return player.hasPotionEffect(PotionEffectType.INVISIBILITY);
-            }
-            return false;
+            if(player == null)
+                return false;
+            return callPlayer(new Callable<Boolean>() {
+                @Override
+                public Boolean call() throws Exception {
+                    return player.hasPotionEffect(PotionEffectType.INVISIBILITY);
+                }
+            }, false);
         }
         @Override
         public boolean isSpectator() {
-          if(player != null) {
-              return player.getGameMode() == GameMode.SPECTATOR;
-          }
-            return false;
+            if(player == null)
+                return false;
+            return callPlayer(new Callable<Boolean>() {
+                @Override
+                public Boolean call() throws Exception {
+                    return player.getGameMode() == GameMode.SPECTATOR;
+                }
+            }, false);
         }
         @Override
         public int getSortWeight() {
@@ -796,7 +1167,13 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
         @Override
         public void sendTitleText(String title, String subtitle, int fadeInTicks, int stayTicks, int fadeOutTIcks) {
         	if (player != null) {
-        		helper.sendTitleText(player, title, subtitle, fadeInTicks, stayTicks, fadeOutTIcks);
+                callPlayer(new Callable<Object>() {
+                    @Override
+                    public Object call() throws Exception {
+                        helper.sendTitleText(player, title, subtitle, fadeInTicks, stayTicks, fadeOutTIcks);
+                        return null;
+                    }
+                }, null);
         	}
     	}
     }
@@ -810,15 +1187,36 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
         
         @Override
         public boolean hasPrivilege(String privid) {
-            if(sender != null)
+            if(sender != null) {
+                if((folia != null) && folia.isFolia() && (sender instanceof Player)) {
+                    final Player p = (Player)sender;
+                    return getFutureValue(folia.callEntity(p, new Callable<Boolean>() {
+                        @Override
+                        public Boolean call() throws Exception {
+                            return permissions.has(sender, privid);
+                        }
+                    }), false);
+                }
                 return permissions.has(sender, privid);
+            }
             return false;
         }
 
         @Override
         public void sendMessage(String msg) {
-            if(sender != null)
-                sender.sendMessage(msg);
+            if(sender != null) {
+                if((folia != null) && folia.isFolia() && (sender instanceof Player)) {
+                    folia.runEntity((Player)sender, new Runnable() {
+                        @Override
+                        public void run() {
+                            sender.sendMessage(msg);
+                        }
+                    }, 0);
+                }
+                else {
+                    sender.sendMessage(msg);
+                }
+            }
         }
 
         @Override
@@ -829,14 +1227,29 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
         }
         @Override
         public boolean isOp() {
-            if(sender != null)
-                return sender.isOp();
-            else
+            if(sender == null)
                 return false;
+            if((folia != null) && folia.isFolia() && (sender instanceof Player)) {
+                return getFutureValue(folia.callEntity((Player)sender, new Callable<Boolean>() {
+                    @Override
+                    public Boolean call() throws Exception {
+                        return sender.isOp();
+                    }
+                }), false);
+            }
+            return sender.isOp();
         }
         @Override
         public boolean hasPermissionNode(String node) {
             if (sender != null) {
+                if((folia != null) && folia.isFolia() && (sender instanceof Player)) {
+                    return getFutureValue(folia.callEntity((Player)sender, new Callable<Boolean>() {
+                        @Override
+                        public Boolean call() throws Exception {
+                            return sender.hasPermission(node);
+                        }
+                    }), false);
+                }
                 return sender.hasPermission(node);
             }
             return false;
@@ -899,6 +1312,36 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
         
         helper = Helper.getHelper();
         pm = this.getServer().getPluginManager();
+        folia = new FoliaCompat(this);
+        BukkitWorld.setThreadSafeAccess(new BukkitWorld.ThreadSafeAccess() {
+            @Override
+            public <T> T callGlobal(Callable<T> task, T def) {
+                if((folia != null) && folia.isFolia()) {
+                    return getFutureValue(folia.callGlobal(task), def);
+                }
+                try {
+                    T val = task.call();
+                    return (val != null) ? val : def;
+                } catch (Exception x) {
+                    Log.warning("Error reading world state", x);
+                    return def;
+                }
+            }
+
+            @Override
+            public <T> T callRegion(World world, int chunkX, int chunkZ, Callable<T> task, T def) {
+                if((folia != null) && folia.isFolia()) {
+                    return getFutureValue(folia.callRegion(world, chunkX, chunkZ, task), def);
+                }
+                try {
+                    T val = task.call();
+                    return (val != null) ? val : def;
+                } catch (Exception x) {
+                    Log.warning("Error reading region state", x);
+                    return def;
+                }
+            }
+        });
         
         ModSupportImpl.init();
     }
@@ -1036,7 +1479,7 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
         tps = 20.0;
         perTickLimit = core.getMaxTickUseMS() * 1000000;
 
-        getServer().getScheduler().scheduleSyncRepeatingTask(this, new Runnable() {
+        folia.runGlobalRepeating(new Runnable() {
             public void run() {
                 processTick();
             }
@@ -1089,6 +1532,9 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
         if (metrics != null) {
             metrics = null;
         }
+        if (folia != null) {
+            folia.cancelTasks();
+        }
         
         /* Disable core */
 	    if (core != null) {
@@ -1103,6 +1549,7 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
         	BukkitVersionHelper.gencache.cleanup();
         	BukkitVersionHelper.gencache = null; 
         }
+        BukkitWorld.setThreadSafeAccess(null);
         Log.info("Disabled");
     }
     
@@ -1240,22 +1687,32 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
 
     @Override
     public final void setPlayerVisiblity(Player player, boolean is_visible) {
-        core.setPlayerVisiblity(player.getName(), is_visible);
+        String name = getSafePlayerName(player);
+        if(name != null) {
+            core.setPlayerVisiblity(name, is_visible);
+        }
     }
 
     @Override
     public final boolean getPlayerVisbility(Player player) {
-        return core.getPlayerVisbility(player.getName());
+        String name = getSafePlayerName(player);
+        return (name != null) && core.getPlayerVisbility(name);
     }
 
     @Override
     public final void postPlayerMessageToWeb(Player player, String message) {
-        core.postPlayerMessageToWeb(player.getName(), player.getDisplayName(), message);
+        String[] names = getSafePlayerNames(player);
+        if(names != null) {
+            core.postPlayerMessageToWeb(names[0], names[1], message);
+        }
     }
 
     @Override
     public void postPlayerJoinQuitToWeb(Player player, boolean isjoin) {
-        core.postPlayerJoinQuitToWeb(player.getName(), player.getDisplayName(), isjoin);
+        String[] names = getSafePlayerNames(player);
+        if(names != null) {
+            core.postPlayerJoinQuitToWeb(names[0], names[1], isjoin);
+        }
     }
 
     @Override
@@ -1271,9 +1728,10 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
         Listener pl = new Listener() {
             @EventHandler(priority=EventPriority.MONITOR, ignoreCancelled=true)
             public void onPlayerJoin(PlayerJoinEvent evt) {
+                warnIfNotEntity("event:PLAYER_JOIN", evt.getPlayer());
                 final DynmapPlayer dp = new BukkitPlayer(evt.getPlayer());
                 // Give other handlers a change to prep player (nicknames and such from Essentials)
-                getServer().getScheduler().scheduleSyncDelayedTask(DynmapPlugin.this, new Runnable() {
+                folia.runEntity(evt.getPlayer(), new Runnable() {
                     @Override
                     public void run() {
                         core.listenerManager.processPlayerEvent(EventType.PLAYER_JOIN, dp);
@@ -1282,6 +1740,7 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
             }
             @EventHandler(priority=EventPriority.MONITOR, ignoreCancelled=true)
             public void onPlayerQuit(PlayerQuitEvent evt) {
+                warnIfNotEntity("event:PLAYER_QUIT", evt.getPlayer());
                 DynmapPlayer dp = new BukkitPlayer(evt.getPlayer());
                 core.listenerManager.processPlayerEvent(EventType.PLAYER_QUIT, dp);
             }
@@ -1294,19 +1753,7 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
             BlockToCheck btt;
             while(blocks_to_check.isEmpty() != true) {
                 btt = blocks_to_check.pop();
-                Location loc = btt.loc;
-                World w = loc.getWorld();
-                if(!w.isChunkLoaded(loc.getBlockX()>>4, loc.getBlockZ()>>4))
-                    continue;
-                int bt = getBlockIdFromBlock(w.getBlockAt(loc));
-                /* Avoid stationary and moving water churn */
-                if(bt == 9) bt = 8;
-                if(btt.typeid == 9) btt.typeid = 8;
-                if((bt != btt.typeid) || (btt.data != w.getBlockAt(loc).getData())) {
-                    String wn = getWorld(w).getName();
-                    invalidateSnapshot(wn, loc.getBlockX(), loc.getBlockY(), loc.getBlockZ());                    	
-                    mapManager.touch(wn, loc.getBlockX(), loc.getBlockY(), loc.getBlockZ(), btt.trigger);
-                }
+                processBlockCheck(btt);
             }
             blocks_to_check = null;
             /* Kick next run, if one is needed */
@@ -1316,18 +1763,47 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
             if((blocks_to_check == null) && (blocks_to_check_accum.isEmpty() == false)) { /* More pending? */
                 blocks_to_check = blocks_to_check_accum;
                 blocks_to_check_accum = new LinkedList<BlockToCheck>();
-                getServer().getScheduler().scheduleSyncDelayedTask(DynmapPlugin.this, this, 10);
+                folia.runGlobal(this, 10);
             }
         }
     }
     private BlockCheckHandler btth = new BlockCheckHandler();
 
+    @SuppressWarnings("deprecation")
+    private void processBlockCheck(BlockToCheck btt) {
+        Location loc = btt.loc;
+        warnIfNotRegion("processBlockCheck", loc);
+        World w = loc.getWorld();
+        if((w == null) || !w.isChunkLoaded(loc.getBlockX()>>4, loc.getBlockZ()>>4))
+            return;
+        int bt = getBlockIdFromBlock(w.getBlockAt(loc));
+        /* Avoid stationary and moving water churn */
+        if(bt == 9) bt = 8;
+        if(btt.typeid == 9) btt.typeid = 8;
+        if((bt != btt.typeid) || (btt.data != w.getBlockAt(loc).getData())) {
+            String wn = getWorld(w).getName();
+            invalidateSnapshot(wn, loc.getBlockX(), loc.getBlockY(), loc.getBlockZ());
+            mapManager.touch(wn, loc.getBlockX(), loc.getBlockY(), loc.getBlockZ(), btt.trigger);
+        }
+    }
+
+    @SuppressWarnings("deprecation")
     private void checkBlock(Block b, String trigger) {
         BlockToCheck btt = new BlockToCheck();
         btt.loc = b.getLocation();
+        warnIfNotRegion("checkBlock:" + trigger, btt.loc);
         btt.typeid = getBlockIdFromBlock(b);
         btt.data = b.getData();
         btt.trigger = trigger;
+        if((folia != null) && folia.isFolia()) {
+            folia.runRegion(btt.loc, new Runnable() {
+                @Override
+                public void run() {
+                    processBlockCheck(btt);
+                }
+            }, 10);
+            return;
+        }
         blocks_to_check_accum.add(btt); /* Add to accumulator */
         btth.startIfNeeded();
     }
@@ -1367,6 +1843,18 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
     	}
     }
 
+    private void warnIfNotRegion(String action, Location loc) {
+        if((folia != null) && folia.isFolia()) {
+            folia.warnIfNotRegion(action, loc);
+        }
+    }
+
+    private void warnIfNotEntity(String action, Player player) {
+        if((folia != null) && folia.isFolia()) {
+            folia.warnIfNotEntity(action, player);
+        }
+    }
+
     private void registerEvents() {
         
         // To trigger rendering.
@@ -1387,6 +1875,7 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
                 @EventHandler(priority=EventPriority.MONITOR, ignoreCancelled=true)
                 public void onBlockPlace(BlockPlaceEvent event) {
                     Location loc = event.getBlock().getLocation();
+                    warnIfNotRegion("event:blockplace", loc);
                     String wn = getWorld(loc.getWorld()).getName();
                     invalidateSnapshot(wn, loc.getBlockX(), loc.getBlockY(), loc.getBlockZ());                  	
                     mapManager.touch(wn, loc.getBlockX(), loc.getBlockY(), loc.getBlockZ(), "blockplace");
@@ -1402,6 +1891,7 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
                     Block b = event.getBlock();
                     if(b == null) return;   /* Stupid mod workaround */
                     Location loc = b.getLocation();
+                    warnIfNotRegion("event:blockbreak", loc);
                     String wn = getWorld(loc.getWorld()).getName();
                 	invalidateSnapshot(wn, loc.getBlockX(), loc.getBlockY(), loc.getBlockZ());               	
                     mapManager.touch(wn, loc.getBlockX(), loc.getBlockY(), loc.getBlockZ(), "blockbreak");
@@ -1415,6 +1905,7 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
                 @EventHandler(priority=EventPriority.MONITOR, ignoreCancelled=true)
                 public void onLeavesDecay(LeavesDecayEvent event) {
                     Location loc = event.getBlock().getLocation();
+                    warnIfNotRegion("event:leavesdecay", loc);
                     String wn = getWorld(loc.getWorld()).getName();
                     invalidateSnapshot(wn, loc.getBlockX(), loc.getBlockY(), loc.getBlockZ());         	
                     if(onleaves) {
@@ -1430,6 +1921,7 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
                 @EventHandler(priority=EventPriority.MONITOR, ignoreCancelled=true)
                 public void onBlockBurn(BlockBurnEvent event) {
                     Location loc = event.getBlock().getLocation();
+                    warnIfNotRegion("event:blockburn", loc);
                     String wn = getWorld(loc.getWorld()).getName();
                 	invalidateSnapshot(wn, loc.getBlockX(), loc.getBlockY(), loc.getBlockZ());      	
                     if(onburn) {
@@ -1448,9 +1940,7 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
                     Material m = b.getType();
                     if(m == null) return;
                     switch(m) {
-                        case STATIONARY_WATER:
                         case WATER:
-                        case STATIONARY_LAVA:
                         case LAVA:
                         case GRAVEL:
                         case SAND:
@@ -1489,6 +1979,7 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
                 public void onBlockPistonRetract(BlockPistonRetractEvent event) {
                     Block b = event.getBlock();
                     Location loc = b.getLocation();
+                    warnIfNotRegion("event:pistonretract", loc);
                     BlockFace dir;
                     try {   /* Workaround Bukkit bug = http://leaky.bukkit.org/issues/1227 */
                         dir = event.getDirection();
@@ -1513,6 +2004,7 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
                 public void onBlockPistonExtend(BlockPistonExtendEvent event) {
                     Block b = event.getBlock();
                     Location loc = b.getLocation();
+                    warnIfNotRegion("event:pistonextend", loc);
                     BlockFace dir;
                     try {   /* Workaround Bukkit bug = http://leaky.bukkit.org/issues/1227 */
                         dir = event.getDirection();
@@ -1541,6 +2033,7 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
                 @EventHandler(priority=EventPriority.MONITOR, ignoreCancelled=true)
                 public void onBlockSpread(BlockSpreadEvent event) {
                     Location loc = event.getBlock().getLocation();
+                    warnIfNotRegion("event:blockspread", loc);
                     String wn = getWorld(loc.getWorld()).getName();
                     invalidateSnapshot(wn, loc.getBlockX(), loc.getBlockY(), loc.getBlockZ());
                     mapManager.touch(wn, loc.getBlockX(), loc.getBlockY(), loc.getBlockZ(), "blockspread");
@@ -1554,6 +2047,7 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
                 @EventHandler(priority=EventPriority.MONITOR, ignoreCancelled=true)
                 public void onBlockForm(BlockFormEvent event) {
                     Location loc = event.getBlock().getLocation();
+                    warnIfNotRegion("event:blockform", loc);
                     String wn = getWorld(loc.getWorld()).getName();
                     invalidateSnapshot(wn, loc.getBlockX(), loc.getBlockY(), loc.getBlockZ());
                     mapManager.touch(wn, loc.getBlockX(), loc.getBlockY(), loc.getBlockZ(), "blockform");
@@ -1567,6 +2061,7 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
                 @EventHandler(priority=EventPriority.MONITOR, ignoreCancelled=true)
                 public void onBlockFade(BlockFadeEvent event) {
                     Location loc = event.getBlock().getLocation();
+                    warnIfNotRegion("event:blockfade", loc);
                     String wn = getWorld(loc.getWorld()).getName();
                     invalidateSnapshot(wn, loc.getBlockX(), loc.getBlockY(), loc.getBlockZ());
                     mapManager.touch(wn, loc.getBlockX(), loc.getBlockY(), loc.getBlockZ(), "blockfade");
@@ -1582,6 +2077,7 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
                 @EventHandler(priority=EventPriority.MONITOR, ignoreCancelled=true)
                 public void onBlockGrow(BlockGrowEvent event) {
                     Location loc = event.getBlock().getLocation();
+                    warnIfNotRegion("event:blockgrow", loc);
                     String wn = getWorld(loc.getWorld()).getName();
                     invalidateSnapshot(wn, loc.getBlockX(), loc.getBlockY(), loc.getBlockZ());
                     mapManager.touch(wn, loc.getBlockX(), loc.getBlockY(), loc.getBlockZ(), "blockgrow");
@@ -1595,6 +2091,7 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
                 @EventHandler(priority=EventPriority.MONITOR, ignoreCancelled=true)
                 public void onBlockRedstone(BlockRedstoneEvent event) {
                     Location loc = event.getBlock().getLocation();
+                    warnIfNotRegion("event:blockredstone", loc);
                     String wn = getWorld(loc.getWorld()).getName();
                     invalidateSnapshot(wn, loc.getBlockX(), loc.getBlockY(), loc.getBlockZ());
                     mapManager.touch(wn, loc.getBlockX(), loc.getBlockY(), loc.getBlockZ(), "blockredstone");
@@ -1608,7 +2105,9 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
             @EventHandler(priority=EventPriority.MONITOR, ignoreCancelled=true)
             public void onPlayerJoin(PlayerJoinEvent event) {
                 if(onplayerjoin) {
+                    warnIfNotEntity("event:playerjoin", event.getPlayer());
                     Location loc = event.getPlayer().getLocation();
+                    warnIfNotRegion("event:playerjoin", loc);
                     mapManager.touch(getWorld(loc.getWorld()).getName(), loc.getBlockX(), loc.getBlockY(), loc.getBlockZ(), "playerjoin");
                 }
             }
@@ -1622,7 +2121,9 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
             Listener playermove = new Listener() {
                 @EventHandler(priority=EventPriority.MONITOR, ignoreCancelled=true)
                 public void onPlayerMove(PlayerMoveEvent event) {
+                    warnIfNotEntity("event:playermove", event.getPlayer());
                     Location loc = event.getPlayer().getLocation();
+                    warnIfNotRegion("event:playermove", loc);
                     mapManager.touch(getWorld(loc.getWorld()).getName(), loc.getBlockX(), loc.getBlockY(), loc.getBlockZ(), "playermove");
                 }
             };
@@ -1634,6 +2135,7 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
             @EventHandler(priority=EventPriority.MONITOR, ignoreCancelled=true)
             public void onEntityExplode(EntityExplodeEvent event) {
                 Location loc = event.getLocation();
+                warnIfNotRegion("event:entityexplode", loc);
                 String wname = getWorld(loc.getWorld()).getName();
                 int minx, maxx, miny, maxy, minz, maxz;
                 minx = maxx = loc.getBlockX();
@@ -1682,6 +2184,7 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
             @EventHandler(priority=EventPriority.MONITOR, ignoreCancelled=true)
             public void onStructureGrow(StructureGrowEvent event) {
                 Location loc = event.getLocation();
+                warnIfNotRegion("event:structuregrow", loc);
                 String wname = getWorld(loc.getWorld()).getName();
                 int minx, maxx, miny, maxy, minz, maxz;
                 minx = maxx = loc.getBlockX();
@@ -1717,6 +2220,7 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
                 public void onChunkPopulate(ChunkPopulateEvent event) {
                 	DynmapWorld dw = getWorld(event.getWorld());
                     Chunk c = event.getChunk();
+                    warnIfNotRegion("event:chunkpopulate", new Location(event.getWorld(), c.getX() << 4, 0, c.getZ() << 4));
                     /* Touch extreme corners */
                     int x = c.getX() << 4;
                     int z = c.getZ() << 4;
@@ -1738,7 +2242,10 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
     @Override
     public void assertPlayerInvisibility(Player player, boolean is_invisible,
             Plugin plugin) {
-        core.assertPlayerInvisibility(player.getName(), is_invisible, plugin.getDescription().getName());
+        String name = getSafePlayerName(player);
+        if(name != null) {
+            core.assertPlayerInvisibility(name, is_invisible, plugin.getDescription().getName());
+        }
     }
 
     @Override
@@ -1750,7 +2257,10 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
     @Override
     public void assertPlayerVisibility(Player player, boolean is_visible,
             Plugin plugin) {
-        core.assertPlayerVisibility(player.getName(), is_visible, plugin.getDescription().getName());
+        String name = getSafePlayerName(player);
+        if(name != null) {
+            core.assertPlayerVisibility(name, is_visible, plugin.getDescription().getName());
+        }
     }
     @Override
     public boolean setDisableChatToWebProcessing(boolean disable) {
@@ -1803,11 +2313,16 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
     }
     
     private void initMetrics() {
-        metrics = new Metrics(this, 619);
+        try {
+            metrics = new Metrics(this, 619);
 
-        metrics.addCustomChart(new FeatureChart());
+            metrics.addCustomChart(new FeatureChart());
 
-        metrics.addCustomChart(new MapChart());
+            metrics.addCustomChart(new MapChart());
+        } catch (Throwable t) {
+            Log.warning("Unable to initialize bStats metrics - continuing without metrics", t);
+            metrics = null;
+        }
     }
     
     @Override
