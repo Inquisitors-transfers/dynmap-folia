@@ -536,8 +536,8 @@ public class HDBlockModels {
                         }
                     }
                     else {
-                        Log.warning("Invalid rotate error - line " + lineNum + " of file: " + fname);
-                        continue;
+                        Log.severe("Invalid rotate error - line " + lineNum + " of file: " + fname);
+                        return;
                     }
                 }
                 else if (typeid.equals("ignore-updates")) {

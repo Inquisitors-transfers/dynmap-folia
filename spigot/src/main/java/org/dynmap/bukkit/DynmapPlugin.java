@@ -80,6 +80,7 @@ import org.dynmap.PlayerList;
 import org.dynmap.bukkit.helper.BukkitVersionHelper;
 import org.dynmap.bukkit.helper.BukkitWorld;
 import org.dynmap.bukkit.helper.AbstractMapChunkCache;
+import org.dynmap.bukkit.helper.FoliaAccess;
 import org.dynmap.bukkit.helper.SnapshotCache;
 import org.dynmap.bukkit.permissions.BukkitPermissions;
 import org.dynmap.bukkit.permissions.NijikokunPermissions;
@@ -133,7 +134,7 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
     /* Lookup cache */
     private World last_world;
     private BukkitWorld last_bworld;
-    private FoliaCompat folia;
+    private FoliaAccess folia;
     private int foliaChunkBatchSize = 16;
     
     private BukkitVersionHelper helper;
@@ -168,9 +169,59 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
             last_bworld = null;
         }
     }
+
+    private boolean isFolia() {
+        return (folia != null) && folia.isFolia();
+    }
+
+    private void runGlobalTask(Runnable run, long delay) {
+        if(isFolia()) {
+            folia.runGlobal(run, delay);
+        }
+        else if(this.isEnabled()) {
+            getServer().getScheduler().scheduleSyncDelayedTask(this, run, delay);
+        }
+    }
+
+    private void runGlobalRepeatingTask(Runnable run, long initialDelay, long period) {
+        if(isFolia()) {
+            folia.runGlobalRepeating(run, initialDelay, period);
+        }
+        else {
+            getServer().getScheduler().scheduleSyncRepeatingTask(this, run, initialDelay, period);
+        }
+    }
+
+    private void runRegionTask(Location loc, Runnable run, long delay) {
+        if(isFolia()) {
+            folia.runRegion(loc, run, delay);
+        }
+        else {
+            runGlobalTask(run, delay);
+        }
+    }
+
+    private void runEntityTask(Player player, Runnable run, long delay) {
+        if(isFolia()) {
+            folia.runEntity(player, run, delay);
+        }
+        else {
+            runGlobalTask(run, delay);
+        }
+    }
     
     // Nonblocking thread safety
     private static final AtomicBoolean tryNativeId = new AtomicBoolean(true);
+    private static final Attribute armorAttribute = getAttributeByName("ARMOR", Attribute.GENERIC_ARMOR);
+
+    private static Attribute getAttributeByName(String name, Attribute def) {
+        try {
+            return Attribute.valueOf(name);
+        } catch (IllegalArgumentException x) {
+            return def;
+        }
+    }
+
     @SuppressWarnings("deprecation")
     private static final int getBlockIdFromMaterial(Material material) {
         if (tryNativeId.get()) {
@@ -343,7 +394,7 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
 
         @Override
         public void scheduleServerTask(Runnable run, long delay) {
-            folia.runGlobal(run, delay);
+            runGlobalTask(run, delay);
         }
         @Override
         public DynmapPlayer[] getOnlinePlayers() {
@@ -415,10 +466,11 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
         }
         @Override
         public <T> Future<T> callSyncMethod(Callable<T> task) {
-            if(DynmapPlugin.this.isEnabled())
-                return folia.callGlobal(task);
-            else
+            if(!DynmapPlugin.this.isEnabled())
                 return null;
+            if(isFolia())
+                return folia.callGlobal(task);
+            return getServer().getScheduler().callSyncMethod(DynmapPlugin.this, task);
         }
         private boolean noservername = false;
         @Override
@@ -472,7 +524,7 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
         }
         @Override
         public boolean isServerThread() {
-            return folia.isServerThread();
+            return isFolia() ? folia.isServerThread() : Bukkit.isPrimaryThread();
         }
 
         @Override
@@ -518,7 +570,7 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
                         public void onPlayerChat(AsyncPlayerChatEvent evt) {
                             final Player p = evt.getPlayer();
                             final String msg = evt.getMessage();
-                            folia.runEntity(p, new Runnable() {
+                            runEntityTask(p, new Runnable() {
                                 public void run() {
                                     DynmapPlayer dp = null;
                                     if(p != null)
@@ -590,7 +642,7 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
         @Override
         public void broadcastMessage(String msg) {
             if((folia != null) && folia.isFolia()) {
-                folia.runGlobal(new Runnable() {
+                runGlobalTask(new Runnable() {
                     @Override
                     public void run() {
                         getServer().broadcastMessage(msg);
@@ -822,10 +874,7 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
                 }
                 pending = result.retryChunks;
             }
-            if(cc instanceof GenericMapChunkCache) {
-                ((GenericMapChunkCache)cc).finishLoadingChunks();
-            }
-            else if(cc instanceof AbstractMapChunkCache) {
+            if(cc instanceof AbstractMapChunkCache) {
                 ((AbstractMapChunkCache)cc).finishLoadingChunks();
             }
             if(w.isLoaded() == false) {
@@ -856,11 +905,7 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
                     budgetExhausted = true;
                     continue;
                 }
-                if(cc instanceof GenericMapChunkCache) {
-                    ((GenericMapChunkCache)cc).loadChunkForCurrentRegion(chunk);
-                    loaded++;
-                }
-                else if(cc instanceof AbstractMapChunkCache) {
+                if(cc instanceof AbstractMapChunkCache) {
                     ((AbstractMapChunkCache)cc).loadChunkForCurrentRegion(chunk);
                     loaded++;
                 }
@@ -1134,7 +1179,7 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
             return callPlayer(new Callable<Integer>() {
                 @Override
                 public Integer call() throws Exception {
-                    return (int) player.getAttribute(Attribute.ARMOR).getValue();
+                    return (int) player.getAttribute(armorAttribute).getValue();
                 }
             }, 0);
         }
@@ -1275,7 +1320,7 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
         public void sendMessage(String msg) {
             if(sender != null) {
                 if((folia != null) && folia.isFolia() && (sender instanceof Player)) {
-                    folia.runEntity((Player)sender, new Runnable() {
+                    runEntityTask((Player)sender, new Runnable() {
                         @Override
                         public void run() {
                             sender.sendMessage(msg);
@@ -1375,13 +1420,37 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
         }
     }
     
+    private FoliaAccess createFoliaAccess() {
+        String serverName = getServer().getName();
+        String serverVersion = getServer().getVersion();
+        boolean looksLikeFolia = ((serverName != null) && serverName.equalsIgnoreCase("Folia")) ||
+                ((serverVersion != null) && serverVersion.toLowerCase().contains("folia"));
+        if(!looksLikeFolia) {
+            try {
+                Class.forName("io.papermc.paper.threadedregions.RegionizedServer");
+                looksLikeFolia = true;
+            } catch (Throwable ignored) {
+            }
+        }
+        if(!looksLikeFolia) {
+            return null;
+        }
+        try {
+            Class<?> compat = Class.forName("org.dynmap.bukkit.helper.folia26.FoliaAccessFolia26");
+            return (FoliaAccess) compat.getConstructor(Plugin.class).newInstance(this);
+        } catch (Throwable x) {
+            Log.warning("Folia support was requested by the server, but the Folia adapter could not be loaded", x);
+            return null;
+        }
+    }
+
     @Override
     public void onLoad() {
         Log.setLogger(this.getLogger(), "");
         
         helper = Helper.getHelper();
         pm = this.getServer().getPluginManager();
-        folia = new FoliaCompat(this);
+        folia = createFoliaAccess();
         BukkitWorld.setThreadSafeAccess(new BukkitWorld.ThreadSafeAccess() {
             @Override
             public <T> T callGlobal(Callable<T> task, T def) {
@@ -1549,7 +1618,7 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
         tps = 20.0;
         perTickLimit = core.getMaxTickUseMS() * 1000000;
 
-        folia.runGlobalRepeating(new Runnable() {
+        runGlobalRepeatingTask(new Runnable() {
             public void run() {
                 processTick();
             }
@@ -1801,7 +1870,7 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
                 warnIfNotEntity("event:PLAYER_JOIN", evt.getPlayer());
                 final DynmapPlayer dp = new BukkitPlayer(evt.getPlayer());
                 // Give other handlers a change to prep player (nicknames and such from Essentials)
-                folia.runEntity(evt.getPlayer(), new Runnable() {
+                runEntityTask(evt.getPlayer(), new Runnable() {
                     @Override
                     public void run() {
                         core.listenerManager.processPlayerEvent(EventType.PLAYER_JOIN, dp);
@@ -1833,7 +1902,7 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
             if((blocks_to_check == null) && (blocks_to_check_accum.isEmpty() == false)) { /* More pending? */
                 blocks_to_check = blocks_to_check_accum;
                 blocks_to_check_accum = new LinkedList<BlockToCheck>();
-                folia.runGlobal(this, 10);
+                runGlobalTask(this, 10);
             }
         }
     }
@@ -1866,7 +1935,7 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
         btt.data = b.getData();
         btt.trigger = trigger;
         if((folia != null) && folia.isFolia()) {
-            folia.runRegion(btt.loc, new Runnable() {
+            runRegionTask(btt.loc, new Runnable() {
                 @Override
                 public void run() {
                     processBlockCheck(btt);
