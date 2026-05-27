@@ -2,9 +2,11 @@ package org.dynmap.bukkit;
 
 import java.io.File;
 import java.net.InetSocketAddress;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
@@ -78,6 +80,7 @@ import org.dynmap.MapType;
 import org.dynmap.PlayerList;
 import org.dynmap.bukkit.helper.BukkitVersionHelper;
 import org.dynmap.bukkit.helper.BukkitWorld;
+import org.dynmap.bukkit.helper.AbstractMapChunkCache;
 import org.dynmap.bukkit.helper.SnapshotCache;
 import org.dynmap.bukkit.permissions.BukkitPermissions;
 import org.dynmap.bukkit.permissions.NijikokunPermissions;
@@ -132,6 +135,7 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
     private World last_world;
     private BukkitWorld last_bworld;
     private FoliaCompat folia;
+    private static final int FOLIA_CHUNK_BATCH_SIZE = 16;
     
     private BukkitVersionHelper helper;
 
@@ -793,40 +797,53 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
             if(bworld == null) {
                 return null;
             }
-            for(final DynmapChunk chunk : chunks) {
+            List<DynmapChunk> pending = new ArrayList<DynmapChunk>(chunks);
+            while(!pending.isEmpty()) {
                 if(w.isLoaded() == false) {
                     return null;
                 }
-                boolean loaded = false;
-                while(!loaded) {
+                Map<Long, List<DynmapChunk>> groups = groupChunksForFolia(pending);
+                List<DynmapChunk> retry = new ArrayList<DynmapChunk>();
+                boolean madeProgress = false;
+                for(final List<DynmapChunk> group : groups.values()) {
+                    if(w.isLoaded() == false) {
+                        return null;
+                    }
+                    int slots = claimChunkLoadSlots(Math.min(group.size(), FOLIA_CHUNK_BATCH_SIZE));
+                    if(slots <= 0) {
+                        retry.addAll(group);
+                        continue;
+                    }
+                    final List<DynmapChunk> batch = new ArrayList<DynmapChunk>(group.subList(0, slots));
+                    if(slots < group.size()) {
+                        retry.addAll(group.subList(slots, group.size()));
+                    }
                     final World fbworld = bworld;
-                    loaded = getFutureValue(folia.callRegion(fbworld, chunk.x, chunk.z, new Callable<Boolean>() {
+                    final DynmapChunk anchor = batch.get(0);
+                    FoliaChunkBatchResult result = getFutureValue(folia.callRegion(fbworld, anchor.x, anchor.z, new Callable<FoliaChunkBatchResult>() {
                         @Override
-                        public Boolean call() throws Exception {
-                            if(!claimChunkLoadSlot()) {
-                                return false;
-                            }
-                            if(cc instanceof GenericMapChunkCache) {
-                                ((GenericMapChunkCache)cc).loadChunkForCurrentRegion(chunk);
-                            }
-                            else {
-                                cc.loadChunks(1);
-                            }
-                            return true;
+                        public FoliaChunkBatchResult call() throws Exception {
+                            return loadFoliaChunkBatch(fbworld, cc, batch);
                         }
-                    }), false);
-                    if(!loaded) {
-                        try {
-                            Thread.sleep(25);
-                        } catch (InterruptedException ix) {
-                            Thread.currentThread().interrupt();
-                            return null;
-                        }
+                    }), retryFoliaChunkBatch(batch));
+                    retry.addAll(result.retryChunks);
+                    madeProgress |= (result.loadedChunks > 0);
+                }
+                pending = retry;
+                if(!madeProgress && !pending.isEmpty()) {
+                    try {
+                        Thread.sleep(25);
+                    } catch (InterruptedException ix) {
+                        Thread.currentThread().interrupt();
+                        return null;
                     }
                 }
             }
             if(cc instanceof GenericMapChunkCache) {
                 ((GenericMapChunkCache)cc).finishLoadingChunks();
+            }
+            else if(cc instanceof AbstractMapChunkCache) {
+                ((AbstractMapChunkCache)cc).finishLoadingChunks();
             }
             if(w.isLoaded() == false) {
                 return null;
@@ -834,7 +851,49 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
             return cc;
         }
 
-        private boolean claimChunkLoadSlot() {
+        private Map<Long, List<DynmapChunk>> groupChunksForFolia(List<DynmapChunk> chunks) {
+            Map<Long, List<DynmapChunk>> groups = new LinkedHashMap<Long, List<DynmapChunk>>();
+            for(DynmapChunk chunk : chunks) {
+                long key = (((long)(chunk.x >> 5)) << 32) ^ ((chunk.z >> 5) & 0xFFFFFFFFL);
+                List<DynmapChunk> group = groups.get(key);
+                if(group == null) {
+                    group = new ArrayList<DynmapChunk>();
+                    groups.put(key, group);
+                }
+                group.add(chunk);
+            }
+            return groups;
+        }
+
+        private FoliaChunkBatchResult loadFoliaChunkBatch(World world, MapChunkCache cc, List<DynmapChunk> batch) {
+            int loaded = 0;
+            List<DynmapChunk> retry = new ArrayList<DynmapChunk>();
+            for(DynmapChunk chunk : batch) {
+                if(!folia.isOwnedByCurrentRegion(world, chunk.x, chunk.z)) {
+                    retry.add(chunk);
+                    continue;
+                }
+                if(cc instanceof GenericMapChunkCache) {
+                    ((GenericMapChunkCache)cc).loadChunkForCurrentRegion(chunk);
+                    loaded++;
+                }
+                else if(cc instanceof AbstractMapChunkCache) {
+                    ((AbstractMapChunkCache)cc).loadChunkForCurrentRegion(chunk);
+                    loaded++;
+                }
+                else {
+                    cc.loadChunks(1);
+                    loaded++;
+                }
+            }
+            return new FoliaChunkBatchResult(loaded, retry);
+        }
+
+        private FoliaChunkBatchResult retryFoliaChunkBatch(List<DynmapChunk> chunks) {
+            return new FoliaChunkBatchResult(0, new ArrayList<DynmapChunk>(chunks));
+        }
+
+        private int claimChunkLoadSlots(int requested) {
             synchronized(DynmapPlugin.this) {
                 long now = System.nanoTime();
                 if (prev_tick != cur_tick) {
@@ -842,10 +901,21 @@ public class DynmapPlugin extends JavaPlugin implements DynmapAPI {
                     cur_tick_starttime = now;
                 }
                 if((chunks_in_cur_tick <= 0) || ((now - cur_tick_starttime) > perTickLimit)) {
-                    return false;
+                    return 0;
                 }
-                chunks_in_cur_tick--;
-                return true;
+                int claimed = Math.min(chunks_in_cur_tick, requested);
+                chunks_in_cur_tick -= claimed;
+                return claimed;
+            }
+        }
+
+        private class FoliaChunkBatchResult {
+            final int loadedChunks;
+            final List<DynmapChunk> retryChunks;
+
+            FoliaChunkBatchResult(int loadedChunks, List<DynmapChunk> retryChunks) {
+                this.loadedChunks = loadedChunks;
+                this.retryChunks = retryChunks;
             }
         }
         @Override
